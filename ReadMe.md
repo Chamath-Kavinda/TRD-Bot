@@ -498,28 +498,50 @@ Logs contain Telegram user IDs, usernames, names and the links people send. Keep
 
 ## 17. YouTube Support
 
-TRD Bot also accepts YouTube links: `youtube.com/watch?v=...`, `youtu.be/...` and `youtube.com/shorts/...`.
+TRD Bot accepts YouTube links: `youtube.com/watch?v=...`, `youtu.be/...` and `youtube.com/shorts/...`. Unlike Instagram and TikTok, YouTube links open a small menu so the user chooses what to get.
 
-### How it differs
+### YouTube flow
 
-| | Instagram / TikTok | YouTube |
-|---|---|---|
-| Quality | Best available | Best quality that fits under the upload limit (50 MB, or 2 GB with `API_ROOT`) |
-| Length | No limit | `YT_MAX_MINUTES` (default 15) |
-| Live streams | n/a | Rejected |
-| Playlists | n/a | Only the single video is downloaded |
+```mermaid
+flowchart TD
+    A[User sends YouTube link] --> B[Bot: Checking video...]
+    B --> C{Live, or longer than YT_MAX_MINUTES?}
+    C -- Yes --> C1[Reply with reason]
+    C -- No --> D[Message: title, channel, duration<br/>buttons: Video / Audio MP3]
+    D -- Audio MP3 --> E[Convert to MP3 and send audio file]
+    D -- Video --> F[New message: available qualities<br/>with estimated size]
+    F -- Pick a quality --> G[Download that quality and send video]
+    F -- Cancel --> H[Delete the quality message]
+```
 
-Because Telegram bots can upload at most 50 MB, a long or 1080p video is downloaded at a lower resolution so it fits. Short clips and Shorts usually keep full quality.
+1. **Link received:** the bot reads the video's info (title, channel, duration, formats) without downloading.
+2. **Choice message:** shows the title, channel and duration with two buttons: **🎬 Video** and **🎵 Audio (MP3)**.
+3. **Audio:** the bot downloads the best audio, converts it to MP3 with ffmpeg, and sends it as an audio file with title and artist.
+4. **Video:** the bot sends a **new message** listing every quality that exists for that video, for example `🎬 1080p · ~36 MB`, `🎬 720p · ~25 MB`, `🎬 360p · ~8 MB`.
+5. **Quality pick:** the bot downloads that exact quality and sends the video. The menu messages are deleted afterwards.
+
+### Details
+
+| Topic | Behavior |
+|-------|----------|
+| Sizes | The number next to each quality is an estimate (video plus audio). Qualities that would exceed Telegram's upload limit (50 MB, or 2 GB with `API_ROOT`) are hidden, and the message says how many were hidden |
+| Codec | H.264 is preferred because it plays everywhere. If only another codec fits under the limit, that one is used |
+| Vertical videos | Shorts are labelled by their short side, so a 1080x1920 video shows as `1080p` |
+| Length | Videos longer than `YT_MAX_MINUTES` (default 15) are rejected, for both video and audio |
+| Live streams | Rejected |
+| Playlists | Only the single video is used |
+| Buttons | Only the user who sent the link can use them. They expire after 30 minutes. After that, send the link again |
+| Logging | `SENT` or `FAILED` rows go to the Log tab, with the choice in the `Info` column, e.g. `Video 720p · 24.1MB` or `Audio MP3 · 3.4MB` |
 
 ### One-time setup: JavaScript runtime
 
-yt-dlp needs an external JavaScript runtime for full YouTube support. Node.js works and is the default here (`YT_JS_RUNTIME=node`), since you already have it installed. For best results, you can install Deno instead:
+yt-dlp needs an external JavaScript runtime for full YouTube support. Node.js works and is the default here (`YT_JS_RUNTIME=node`). For best results you can install Deno instead:
 
 ```powershell
 winget install --id=DenoLand.Deno
 ```
 
-then set `YT_JS_RUNTIME=deno` in `.env`. Always keep yt-dlp updated (`yt-dlp -U`), as YouTube changes often.
+then set `YT_JS_RUNTIME=deno` in `.env`. Keep yt-dlp updated (`yt-dlp -U`), as YouTube changes often.
 
 ### Settings (`.env`)
 
@@ -533,8 +555,11 @@ then set `YT_JS_RUNTIME=deno` in `.env`. Always keep yt-dlp updated (`yt-dlp -U`
 | Problem | Fix |
 |---------|-----|
 | "Sign in to confirm you're not a bot" | Export YouTube cookies with a "Get cookies.txt" extension and set `COOKIES_FILE` (see section 9). Use a throwaway account |
-| "No video downloaded (too long, private, or blocked)" | Video is over `YT_MAX_MINUTES`, private, age-restricted, or region-locked |
-| Only low quality available | Runtime not working. Check `node -v` or install Deno, then update yt-dlp |
+| "This request expired" | The buttons are older than 30 minutes or the bot was restarted. Send the link again |
+| Buttons do nothing | Restart the bot after updating `bot.js`, and make sure only one copy of the bot is running |
+| "No video downloaded" | Video is private, age-restricted, or region-locked |
+| Only low qualities listed | Runtime not working. Check `node -v` or install Deno, then update yt-dlp |
+| MP3 conversion fails | ffmpeg is missing. Check `ffmpeg -version` |
 | Works on your PC but not on a VPS | YouTube often blocks datacenter IPs. Use cookies or run the bot on a home connection |
 
 ### Sheet summary for YouTube
