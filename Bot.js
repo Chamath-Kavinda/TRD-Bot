@@ -18,8 +18,11 @@ const bot = new Telegraf(process.env.BOT_TOKEN, {
   handlerTimeout: 5 * 60 * 1000,
 });
 
-const MAX_BYTES = (process.env.API_ROOT ? 2000 : 50) * 1024 * 1024;
-const URL_RE = /https?:\/\/(?:[\w-]+\.)?(?:instagram\.com|tiktok\.com)\/\S+/i;
+const MAX_MB = process.env.API_ROOT ? 2000 : 50;
+const MAX_BYTES = MAX_MB * 1024 * 1024;
+const YT_MAX_MINUTES = Number(process.env.YT_MAX_MINUTES) || 15; // longest YouTube video allowed
+const YT_JS_RUNTIME = process.env.YT_JS_RUNTIME || 'node';       // JS runtime yt-dlp uses for YouTube
+const URL_RE = /https?:\/\/(?:[\w-]+\.)?(?:instagram\.com|tiktok\.com|youtube\.com|youtu\.be)\/\S+/i;
 const MAX_PARALLEL = 3;
 let running = 0;
 
@@ -47,7 +50,10 @@ async function sendToSheet(r) {
 }
 
 const platformOf = (url) =>
-  /tiktok\.com/i.test(url) ? 'TikTok' : /instagram\.com/i.test(url) ? 'Instagram' : '-';
+  /tiktok\.com/i.test(url) ? 'TikTok'
+  : /instagram\.com/i.test(url) ? 'Instagram'
+  : /youtube\.com|youtu\.be/i.test(url) ? 'YouTube'
+  : '-';
 
 // status: START | REQUEST | SENT | FAILED
 // START and REQUEST are console-only; only SENT and FAILED go to the Google Sheet
@@ -76,19 +82,33 @@ function logUse(ctx, url, status, info = '') {
 // Download
 // ---------------------------------------------------------------
 function ytdlp(url, dir) {
+  const isYT = /youtube\.com|youtu\.be/i.test(url);
+
+  // Instagram/TikTok: best H.264 video + AAC audio, merged to mp4.
+  // YouTube: best quality that still fits under the upload limit
+  // (`<?` also accepts formats whose size is unknown).
+  const V = MAX_MB - 6; // room for the audio track
+  const format = isYT
+    ? `bv*[vcodec^=avc1][filesize<?${V}M][filesize_approx<?${V}M]+ba[acodec^=mp4a][filesize<?6M]` +
+      `/b[ext=mp4][filesize<?${MAX_MB}M][filesize_approx<?${MAX_MB}M]/w`
+    : 'bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b';
+
   const args = [
-    // best H.264 video + AAC audio, merged to mp4 (plays everywhere in Telegram)
-    '-f', 'bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b',
+    '-f', format,
     '--merge-output-format', 'mp4',
     '--no-playlist',
     '--no-warnings',
     '-o', path.join(dir, '%(id)s.%(ext)s'),
   ];
   if (process.env.COOKIES_FILE) args.push('--cookies', process.env.COOKIES_FILE);
+  if (isYT) {
+    args.push('--js-runtimes', YT_JS_RUNTIME);
+    args.push('--match-filter', `duration<=?${YT_MAX_MINUTES * 60} & !is_live`);
+  }
   args.push(url);
 
   return new Promise((resolve, reject) =>
-    execFile(YTDLP, args, { timeout: 120000 }, (err, _out, stderr) =>
+    execFile(YTDLP, args, { timeout: 180000 }, (err, _out, stderr) =>
       err ? reject(new Error(stderr || err.message)) : resolve()
     )
   );
@@ -96,12 +116,12 @@ function ytdlp(url, dir) {
 
 bot.start((ctx) => {
   logUse(ctx, '-', 'START');
-  return ctx.reply('Welcome to TRD Bot! Send me an Instagram Reel or TikTok link and I\'ll send back the video without watermark.');
+  return ctx.reply('Welcome to TRD Bot! Send me an Instagram Reel, TikTok or YouTube link and I\'ll send back the video without watermark.');
 });
 
 bot.on('text', async (ctx) => {
   const match = ctx.message.text.match(URL_RE);
-  if (!match) return ctx.reply('Send a valid Instagram or TikTok link.');
+  if (!match) return ctx.reply('Send a valid Instagram, TikTok or YouTube link.');
   if (running >= MAX_PARALLEL) return ctx.reply('Busy, try again in a moment.');
 
   running++;
@@ -114,7 +134,7 @@ bot.on('text', async (ctx) => {
     await ytdlp(match[0], dir);
 
     const files = (await fs.readdir(dir)).filter((f) => f.endsWith('.mp4'));
-    if (!files.length) throw new Error('No video found');
+    if (!files.length) throw new Error('No video downloaded (too long, private, or blocked).');
     const file = path.join(dir, files[0]);
 
     const { size } = await fs.stat(file);

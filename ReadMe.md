@@ -1,6 +1,6 @@
 # TRD Bot
 
-A Telegram bot that downloads **Instagram Reels** and **TikTok** videos in high quality, **without watermark**, and sends them back in chat.
+A Telegram bot that downloads **Instagram Reels**, **TikTok** and **YouTube** videos in high quality, **without watermark**, and sends them back in chat.
 
 Stack: **Node.js** · **Telegraf** · **yt-dlp** · **ffmpeg**
 
@@ -24,6 +24,7 @@ Stack: **Node.js** · **Telegraf** · **yt-dlp** · **ffmpeg**
 14. [Security and Legal](#14-security-and-legal)
 15. [Ideas for Extensions](#15-ideas-for-extensions)
 16. [Usage Tracking and Google Sheets](#16-usage-tracking-and-google-sheets)
+17. [YouTube Support](#17-youtube-support)
 
 ---
 
@@ -451,7 +452,7 @@ Keep the web app URL and secret private. The secret makes the bot the only one t
 A Date | B Time | C User ID | D Username | E Name | F Status | G Platform | H URL | I Info
 ```
 
-`Platform` is `TikTok` or `Instagram`. Only `SENT` and `FAILED` rows are saved to the sheet. If you already have a `Log` tab from an older version, right-click column G, choose **Insert 1 column left**, and type `Platform` in G1. Old rows can stay blank. Summary formulas below are not affected.
+`Platform` is `TikTok`, `Instagram` or `YouTube`. Only `SENT` and `FAILED` rows are saved to the sheet. If you already have a `Log` tab from an older version, right-click column G, choose **Insert 1 column left**, and type `Platform` in G1. Old rows can stay blank. Summary formulas below are not affected.
 
 ### Per-user summary tab
 
@@ -492,3 +493,58 @@ To see what a user downloaded, filter the **Log** tab by the User ID column.
 ### Privacy
 
 Logs contain Telegram user IDs, usernames, names and the links people send. Keep the sheet private, and tell users if the bot is public.
+
+---
+
+## 17. YouTube Support
+
+TRD Bot also accepts YouTube links: `youtube.com/watch?v=...`, `youtu.be/...` and `youtube.com/shorts/...`.
+
+### How it differs
+
+| | Instagram / TikTok | YouTube |
+|---|---|---|
+| Quality | Best available | Best quality that fits under the upload limit (50 MB, or 2 GB with `API_ROOT`) |
+| Length | No limit | `YT_MAX_MINUTES` (default 15) |
+| Live streams | n/a | Rejected |
+| Playlists | n/a | Only the single video is downloaded |
+
+Because Telegram bots can upload at most 50 MB, a long or 1080p video is downloaded at a lower resolution so it fits. Short clips and Shorts usually keep full quality.
+
+### One-time setup: JavaScript runtime
+
+yt-dlp needs an external JavaScript runtime for full YouTube support. Node.js works and is the default here (`YT_JS_RUNTIME=node`), since you already have it installed. For best results, you can install Deno instead:
+
+```powershell
+winget install --id=DenoLand.Deno
+```
+
+then set `YT_JS_RUNTIME=deno` in `.env`. Always keep yt-dlp updated (`yt-dlp -U`), as YouTube changes often.
+
+### Settings (`.env`)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `YT_MAX_MINUTES` | `15` | Reject YouTube videos longer than this |
+| `YT_JS_RUNTIME` | `node` | JS runtime passed to yt-dlp (`node` or `deno`) |
+
+### YouTube troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| "Sign in to confirm you're not a bot" | Export YouTube cookies with a "Get cookies.txt" extension and set `COOKIES_FILE` (see section 9). Use a throwaway account |
+| "No video downloaded (too long, private, or blocked)" | Video is over `YT_MAX_MINUTES`, private, age-restricted, or region-locked |
+| Only low quality available | Runtime not working. Check `node -v` or install Deno, then update yt-dlp |
+| Works on your PC but not on a VPS | YouTube often blocks datacenter IPs. Use cookies or run the bot on a home connection |
+
+### Sheet summary for YouTube
+
+Add `YouTube` in `Summary!I1`, then in `I2`:
+
+```
+=ARRAYFORMULA(IF(A2:A="",,COUNTIFS(Log!C:C,A2:A,Log!F:F,"SENT",Log!G:G,"YouTube")))
+```
+
+### Legal note
+
+Downloading YouTube videos is against YouTube's Terms of Service, and most videos are copyrighted. Use it for personal use or your own content.
