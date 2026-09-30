@@ -275,21 +275,34 @@ Cookies expire, so re-export when downloads start failing again. Never commit `c
 
 ## 10. Lifting the 50 MB Limit (Optional)
 
-The public Bot API only accepts uploads up to **50 MB**. Most Reels and TikToks fit, but longer videos may not. To upload up to **2 GB**, run your own Bot API server:
+The public Bot API only accepts bot uploads up to **50 MB**. If you run your own Bot API server **in local mode**, the upload limit rises to **2000 MB (2 GB)**. TRD Bot supports this: when `API_ROOT` is set it automatically raises its limit, allows longer downloads, and stops marking large qualities with ❌.
 
-1. Get `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org) (API development tools).
-2. Build or run [telegram-bot-api](https://github.com/tdlib/telegram-bot-api). Docker example:
-   ```bash
-   docker run -d --name tg-api -p 8081:8081 \
-     -e TELEGRAM_API_ID=YOUR_ID -e TELEGRAM_API_HASH=YOUR_HASH \
-     aiogram/telegram-bot-api:latest
+> Local mode is what unlocks 2 GB. A local server started without `--local` (`TELEGRAM_LOCAL` in the Docker image) keeps the normal limit.
+
+**Requirements:** Docker Desktop (Windows/macOS) or Docker Engine (Linux), and a Telegram `api_id` / `api_hash`.
+
+1. Get `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org) under **API development tools**.
+2. Start the server (PowerShell, one line):
+   ```powershell
+   docker run -d --name telegram-bot-api --restart=always -p 8081:8081 -v telegram-bot-api-data:/var/lib/telegram-bot-api -e TELEGRAM_API_ID=YOUR_ID -e TELEGRAM_API_HASH=YOUR_HASH -e TELEGRAM_LOCAL=1 aiogram/telegram-bot-api:latest
    ```
-3. Log the bot out of the cloud API once by opening `https://api.telegram.org/bot<TOKEN>/logOut` in a browser.
-4. Set in `.env`:
+3. Log the bot out of the official cloud server once. Open this in a browser (replace `<TOKEN>`):
+   ```
+   https://api.telegram.org/bot<TOKEN>/logOut
+   ```
+   You should see `{"ok":true,"result":true}`. After a log out, the bot cannot use the cloud API again for about 10 minutes.
+4. Add to `.env`:
    ```
    API_ROOT=http://localhost:8081
    ```
-5. Restart the bot.
+5. Restart the bot (`npm start`).
+
+**Things to know**
+
+- The Docker container must be running whenever the bot runs. If Docker is off, the bot cannot connect.
+- Large files take longer to download and upload. Raise `YT_MAX_MINUTES` only as far as you need.
+- To go back to the normal cloud API: remove `API_ROOT` from `.env`, call `http://localhost:8081/bot<TOKEN>/close`, and restart the bot.
+- Using a personal Telegram account ("userbot") to upload 2 GB is not recommended. It breaks Telegram's rules for bots and can get the account banned.
 
 ---
 
@@ -517,19 +530,27 @@ flowchart TD
 1. **Link received:** the bot reads the video's info (title, channel, duration, formats) without downloading.
 2. **Choice message:** shows the title, channel and duration with two buttons: **🎬 Video** and **🎵 Audio (MP3)**.
 3. **Audio:** the bot downloads the best audio, converts it to MP3 with ffmpeg, and sends it as an audio file with title and artist.
-4. **Video:** the bot sends a **new message** listing every quality that exists for that video, for example `🎬 1080p · ~36 MB`, `🎬 720p · ~25 MB`, `🎬 360p · ~8 MB`.
+4. **Video:** the bot sends a **new message** listing every quality that exists for that video, with an estimated size:
+   ```
+   🎬 144p · ~36 MB      ❌ 240p · ~59 MB
+   ❌ 360p · ~82 MB      ❌ 480p · ~113 MB
+   ❌ 720p · ~199 MB     ❌ 1080p · ~346 MB
+   ```
+   🎬 means it can be sent. ❌ means it is over Telegram's upload limit. Tapping a ❌ shows a message explaining why, and nothing is downloaded, so no time is wasted.
 5. **Quality pick:** the bot downloads that exact quality and sends the video. The menu messages are deleted afterwards.
 
 ### Details
 
 | Topic | Behavior |
 |-------|----------|
-| Sizes | The number next to each quality is an estimate (video plus audio). Qualities that would exceed Telegram's upload limit (50 MB, or 2 GB with `API_ROOT`) are hidden, and the message says how many were hidden |
+| Sizes | YouTube often does not give exact file sizes, so the bot estimates them from bitrate x duration (video plus audio). Qualities over Telegram's upload limit (50 MB, or 2 GB with `API_ROOT`) are marked ❌ and cannot be downloaded. Longer videos hit the limit at lower qualities |
 | Codec | H.264 is preferred because it plays everywhere. If only another codec fits under the limit, that one is used |
 | Vertical videos | Shorts are labelled by their short side, so a 1080x1920 video shows as `1080p` |
-| Length | Videos longer than `YT_MAX_MINUTES` (default 15) are rejected, for both video and audio |
+| Length | Videos longer than `YT_MAX_MINUTES` are rejected, for both video and audio. Set it in `.env` (e.g. `YT_MAX_MINUTES=30`) |
+| MP3 quality | Up to 256 kbps. For long videos the bitrate is lowered automatically so the file stays under the upload limit (about 214 kbps at 30 minutes) |
 | Live streams | Rejected |
 | Playlists | Only the single video is used |
+| Big files | To allow larger qualities, use a local Bot API server (section 10) |
 | Buttons | Only the user who sent the link can use them. They expire after 30 minutes. After that, send the link again |
 | Logging | `SENT` or `FAILED` rows go to the Log tab, with the choice in the `Info` column, e.g. `Video 720p · 24.1MB` or `Audio MP3 · 3.4MB` |
 
@@ -547,7 +568,7 @@ then set `YT_JS_RUNTIME=deno` in `.env`. Keep yt-dlp updated (`yt-dlp -U`), as Y
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `YT_MAX_MINUTES` | `15` | Reject YouTube videos longer than this |
+| `YT_MAX_MINUTES` | `15` | Reject YouTube videos longer than this (minutes) |
 | `YT_JS_RUNTIME` | `node` | JS runtime passed to yt-dlp (`node` or `deno`) |
 
 ### YouTube troubleshooting

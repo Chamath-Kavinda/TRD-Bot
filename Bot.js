@@ -15,11 +15,12 @@ const YTDLP = process.env.YTDLP_PATH || 'yt-dlp';
 
 const bot = new Telegraf(process.env.BOT_TOKEN, {
   telegram: process.env.API_ROOT ? { apiRoot: process.env.API_ROOT } : {},
-  handlerTimeout: 5 * 60 * 1000,
+  handlerTimeout: (process.env.API_ROOT ? 30 : 5) * 60 * 1000,
 });
 
 const MAX_MB = process.env.API_ROOT ? 2000 : 50;
 const MAX_BYTES = MAX_MB * 1024 * 1024;
+const DL_TIMEOUT = (MAX_MB > 100 ? 25 : 3) * 60 * 1000; // download timeout per file
 const YT_MAX_MINUTES = Number(process.env.YT_MAX_MINUTES) || 15; // longest YouTube video allowed
 const YT_JS_RUNTIME = process.env.YT_JS_RUNTIME || 'node';       // JS runtime yt-dlp uses for YouTube
 const URL_RE = /https?:\/\/(?:[\w-]+\.)?(?:instagram\.com|tiktok\.com|youtube\.com|youtu\.be)\/\S+/i;
@@ -90,13 +91,13 @@ function commonArgs(url) {
 }
 
 // mode: 'video' | 'audio'   height: exact video height (YouTube only)
-function ytdlp(url, dir, mode = 'video', height) {
+function ytdlp(url, dir, mode = 'video', height, audioKbps = 192) {
   let format = 'bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b'; // Instagram / TikTok
   let extra = ['--merge-output-format', 'mp4'];
 
   if (mode === 'audio') {
     format = 'ba/b';
-    extra = ['-x', '--audio-format', 'mp3', '--audio-quality', '0'];
+    extra = ['-x', '--audio-format', 'mp3', '--audio-quality', `${audioKbps}K`];
   } else if (height) {
     const H = height;
     const V = MAX_MB - 6; // room for the audio track
@@ -105,11 +106,12 @@ function ytdlp(url, dir, mode = 'video', height) {
       `bv*[height=${H}][vcodec^=avc1]${fit}+ba[acodec^=mp4a]` + // H.264 that fits
       `/bv*[height=${H}]${fit}+ba` +                             // any codec that fits
       `/b[height=${H}]/bv*[height<=${H}]${fit}+ba`;
+    extra.push('--max-filesize', `${V}M`); // abort instead of downloading a huge file
   }
 
   const args = ['-f', format, ...extra, ...commonArgs(url), '-o', path.join(dir, '%(id)s.%(ext)s'), url];
   return new Promise((resolve, reject) =>
-    execFile(YTDLP, args, { timeout: 180000 }, (err, _out, stderr) =>
+    execFile(YTDLP, args, { timeout: DL_TIMEOUT }, (err, _out, stderr) =>
       err ? reject(new Error(stderr || err.message)) : resolve()
     )
   );
@@ -146,41 +148,49 @@ function fetchYtInfo(url) {
 }
 
 // ---- quality options ----
-// Lists the video heights that exist and fit under Telegram's upload limit
+// One entry per available video height, with an estimated size and a tooBig flag.
+// YouTube often omits exact file sizes, so we fall back to bitrate x duration.
 function qualityOptions(meta) {
+  const dur = meta.duration || 0;
   const isVid = (f) => f.height && f.vcodec && f.vcodec !== 'none';
   const isAud = (f) => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none');
+  const estimate = (f, kbps) => f.size || (kbps && dur ? Math.round(kbps * 125 * dur * 1.05) : null);
 
   const bestAudio = meta.formats.filter(isAud).sort((a, b) => b.abr - a.abr)[0];
-  const audioSize = (bestAudio && bestAudio.size) || 0;
+  const audioSize = bestAudio ? estimate(bestAudio, bestAudio.abr || bestAudio.tbr) || 0 : 0;
 
-  // group by height, keep only streams that fit the limit (or have unknown size),
+  // total size of video + audio for one stream (null = unknown)
+  const totalSize = (f) => {
+    const v = estimate(f, f.tbr);
+    if (v === null) return null;
+    const hasAudio = f.acodec && f.acodec !== 'none';
+    return v + (hasAudio ? 0 : audioSize);
+  };
   // prefer H.264 (plays everywhere), then higher bitrate
   const score = (f) => (f.vcodec.startsWith('avc1') ? 1e6 : 0) + f.tbr;
-  const totalSize = (f) => {
-    const hasAudio = f.acodec && f.acodec !== 'none';
-    return f.size ? f.size + (hasAudio ? 0 : audioSize) : null;
-  };
+
   const groups = new Map();
   for (const f of meta.formats.filter(isVid)) {
     if (!groups.has(f.height)) groups.set(f.height, []);
-    groups.get(f.height).push(f);
+    groups.get(f.height).push({ f, size: totalSize(f) });
   }
 
   const list = [];
-  let hidden = 0;
-  for (const [height, fs_] of groups) {
-    const fitting = fs_.filter((f) => totalSize(f) === null || totalSize(f) <= MAX_BYTES);
-    if (!fitting.length) { hidden++; continue; }
-    const f = fitting.sort((x, y) => score(y) - score(x))[0];
+  for (const [height, cands] of groups) {
+    const fitting = cands.filter((c) => c.size === null || c.size <= MAX_BYTES);
+    const tooBig = fitting.length === 0;
+    const pick = tooBig
+      ? cands.sort((x, y) => x.size - y.size)[0]            // smallest option, still too big
+      : fitting.sort((x, y) => score(y.f) - score(x.f))[0]; // best option that fits
     list.push({
       height, // used for downloading
-      label: Math.min(f.width || f.height, f.height), // 1080x1920 shorts show as 1080p
-      size: totalSize(f),
+      label: Math.min(pick.f.width || pick.f.height, pick.f.height), // 1080x1920 shorts show as 1080p
+      size: pick.size,
+      tooBig,
     });
   }
   list.sort((x, y) => y.height - x.height);
-  return { list, hidden };
+  return { list };
 }
 // ---- end quality options ----
 
@@ -189,6 +199,8 @@ const fmtDur = (s) => {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
   return h ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
 };
+const fmtSize = (bytes) =>
+  bytes >= 1073741824 ? (bytes / 1073741824).toFixed(1) + ' GB' : Math.max(1, Math.round(bytes / 1048576)) + ' MB';
 const safeName = (t) => (t || 'audio').replace(/[\\/:*?"<>|]+/g, ' ').trim().slice(0, 80) || 'audio';
 const lastLine = (msg) => msg.split('\n').filter(Boolean).pop().slice(0, 120);
 
@@ -200,11 +212,14 @@ async function job(ctx, url, statusId, mode, height, opts = {}) {
   const dir = path.join(os.tmpdir(), 'trd-' + crypto.randomBytes(6).toString('hex'));
   try {
     await fs.mkdir(dir, { recursive: true });
-    await ytdlp(url, dir, mode, height);
+    // MP3 bitrate: up to 256 kbps, lowered for long videos so the file stays under the upload limit
+    const dur = (opts.meta && opts.meta.duration) || 0;
+    const kbps = dur ? Math.max(64, Math.min(256, Math.floor(((MAX_BYTES * 8) / dur / 1000) * 0.92))) : 192;
+    await ytdlp(url, dir, mode, height, kbps);
 
     const ext = mode === 'audio' ? '.mp3' : '.mp4';
     const files = (await fs.readdir(dir)).filter((f) => f.endsWith(ext));
-    if (!files.length) throw new Error('No video downloaded (too long, private, or blocked).');
+    if (!files.length) throw new Error('No file downloaded (over the size limit, private, or blocked).');
     const file = path.join(dir, files[0]);
 
     const { size } = await fs.stat(file);
@@ -287,14 +302,14 @@ bot.action(/^yt:([avqc]):([0-9a-f]{8})(?::(\d+))?$/, async (ctx) => {
 
   // Video chosen -> new message listing the available qualities
   if (act === 'v') {
-    const { list, hidden } = qualityOptions(entry.meta);
+    const { list } = qualityOptions(entry.meta);
     if (!list.length)
-      return ctx.answerCbQuery("No video quality fits Telegram's size limit. Try Audio.", { show_alert: true });
+      return ctx.answerCbQuery('No video formats found for this link. Try Audio.', { show_alert: true });
     await ctx.answerCbQuery();
 
     const buttons = list.map((o) =>
       Markup.button.callback(
-        `🎬 ${o.label}p${o.size ? ' · ~' + Math.max(1, Math.round(o.size / 1048576)) + ' MB' : ''}`,
+        `${o.tooBig ? '❌' : '🎬'} ${o.label}p${o.size ? ' · ~' + fmtSize(o.size) : ''}`,
         `yt:q:${token}:${o.height}`
       )
     );
@@ -302,24 +317,30 @@ bot.action(/^yt:([avqc]):([0-9a-f]{8})(?::(\d+))?$/, async (ctx) => {
     for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
     rows.push([Markup.button.callback('✖ Cancel', `yt:c:${token}`)]);
 
-    let text = `📺 Available qualities\n${entry.meta.title}`;
-    if (hidden) text += `\n\n⚠️ ${hidden} higher quality option(s) hidden: over Telegram's ${MAX_MB} MB limit.`;
+    let text = `📺 Available qualities\n${entry.meta.title}\n\nSizes are estimates (video + audio).`;
+    if (list.some((o) => o.tooBig)) text += `\n❌ = too large to send (limit ${MAX_MB} MB). Pick a smaller one or Audio.`;
     return ctx.reply(text, Markup.inlineKeyboard(rows));
   }
 
-  // Audio (a) or a chosen quality (q) -> download
-  if (running >= MAX_PARALLEL)
-    return ctx.answerCbQuery('Busy, try again in a moment.', { show_alert: true });
-
+  // Validate a chosen quality before anything else
   let height, label;
   if (act === 'q') {
     height = Number(h);
     const opt = qualityOptions(entry.meta).list.find((o) => o.height === height);
     if (!opt) return ctx.answerCbQuery('That quality is not available.', { show_alert: true });
+    if (opt.tooBig)
+      return ctx.answerCbQuery(
+        `❌ ${opt.label}p is about ${fmtSize(opt.size)}, over the ${MAX_MB} MB limit. Choose a smaller quality or Audio.`,
+        { show_alert: true }
+      );
     label = `Video ${opt.label}p`;
   } else {
     label = 'Audio MP3';
   }
+
+  // Audio (a) or a chosen quality (q) -> download
+  if (running >= MAX_PARALLEL)
+    return ctx.answerCbQuery('Busy, try again in a moment.', { show_alert: true });
 
   await ctx.answerCbQuery();
   if (act === 'q') ctx.telegram.deleteMessage(ctx.chat.id, entry.choiceMsgId).catch(() => {});
